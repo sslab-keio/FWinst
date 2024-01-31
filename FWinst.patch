@@ -1,0 +1,249 @@
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index fb9f5fa96..013038c84 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1945,6 +1945,11 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
+ #define EMULTYPE_PF		    (1 << 6)
+ #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
+ #define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
++#define EMULTYPE_MMIO		    (1 << 9)
++#define EMULTYPE_IO		    (1 << 10)
++#define EMULTYPE_APIC		    (1 << 11)
++#define EMULTYPE_UMIP		    (1 << 12)
++#define EMULTYPE_REASON_MASK	    (0xf << 9)
+
+ int kvm_emulate_instruction(struct kvm_vcpu *vcpu, int emulation_type);
+ int kvm_emulate_instruction_from_buffer(struct kvm_vcpu *vcpu,
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 2673cd5c4..d6ba3dd28 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -4757,6 +4757,77 @@ static int decode_operand(struct x86_emulate_ctxt *ctxt, struct operand *op,
+ 	return rc;
+ }
+
++static int fwinst_mmio(struct x86_emulate_ctxt *ctxt)
++{
++	u64 op_mem_flags = ModRM | MemAbs | DstDI | SrcSI | SrcXLat;
++
++	if (!(ctxt->d & op_mem_flags))
++		return X86EMUL_FILTERED;
++
++	if (ctxt->opcode_len == 1) {
++		if (ctxt->d & Fastop) {
++			if (ctxt->fop == (em_cmp) ||
++			    ctxt->fop == (em_or) ||
++			    ctxt->fop == (em_test))
++				return X86EMUL_CONTINUE;
++		} else {
++			if (ctxt->execute == (em_mov) ||
++			    ctxt->execute == (em_xchg))
++				return X86EMUL_CONTINUE;
++		}
++	} else if (ctxt->opcode_len == 2) {
++		switch (ctxt->b) {
++		case 0xb6 ... 0xb7:
++		case 0xbe ... 0xbf:
++			return X86EMUL_CONTINUE;
++		default:
++			break;
++		}
++	}
++
++	return X86EMUL_FILTERED;
++}
++
++static int fwinst_io(struct x86_emulate_ctxt *ctxt)
++{
++	if (ctxt->opcode_len != 1)
++		return X86EMUL_FILTERED;
++
++	if (ctxt->execute == (em_in) ||
++	    ctxt->execute == (em_out))
++		return X86EMUL_CONTINUE;
++
++	return X86EMUL_FILTERED;
++}
++
++static int fwinst_umip(struct x86_emulate_ctxt *ctxt)
++{
++	// GDT, SIDT, SLDT, SMSW, or STR
++	if (ctxt->execute == (em_sgdt) ||
++	    ctxt->execute == (em_sidt) ||
++	    ctxt->execute == (em_sldt) ||
++	    ctxt->execute == (em_smsw) ||
++	    ctxt->execute == (em_str) ||
++	    ctxt->execute == (em_lgdt) ||
++	    ctxt->execute == (em_lidt) ||
++	    ctxt->execute == (em_lldt) ||
++	    ctxt->execute == (em_ltr))
++		return X86EMUL_CONTINUE;
++	return X86EMUL_FILTERED;
++}
++
++static int fwinst_x86_decode_insn(struct x86_emulate_ctxt *ctxt, int emulation_type)
++{
++	if (emulation_type & EMULTYPE_MMIO || emulation_type & EMULTYPE_APIC)
++		return fwinst_mmio(ctxt);
++	else if (emulation_type & EMULTYPE_IO)
++		return fwinst_io(ctxt);
++	else if (emulation_type & EMULTYPE_UMIP)
++		return fwinst_umip(ctxt);
++
++	return X86EMUL_CONTINUE;
++}
++
+ int x86_decode_insn(struct x86_emulate_ctxt *ctxt, void *insn, int insn_len, int emulation_type)
+ {
+ 	int rc = X86EMUL_CONTINUE;
+@@ -4970,6 +5041,11 @@ int x86_decode_insn(struct x86_emulate_ctxt *ctxt, void *insn, int insn_len, int
+
+ 	ctxt->execute = opcode.u.execute;
+
++	if (emulation_type & EMULTYPE_REASON_MASK) {
++		if (fwinst_x86_decode_insn(ctxt, emulation_type) == X86EMUL_FILTERED)
++			return EMULATION_REJECTED;
++	}
++
+ 	if (unlikely(emulation_type & EMULTYPE_TRAP_UD) &&
+ 	    likely(!(ctxt->d & EmulateOnUD)))
+ 		return EMULATION_FAILED;
+diff --git a/arch/x86/kvm/kvm_emulate.h b/arch/x86/kvm/kvm_emulate.h
+index be7aeb9b8..3a36d2866 100644
+--- a/arch/x86/kvm/kvm_emulate.h
++++ b/arch/x86/kvm/kvm_emulate.h
+@@ -87,6 +87,7 @@ struct x86_instruction_info {
+ #define X86EMUL_CMPXCHG_FAILED  4 /* cmpxchg did not see expected value */
+ #define X86EMUL_IO_NEEDED       5 /* IO is needed to complete emulation */
+ #define X86EMUL_INTERCEPTED     6 /* Intercepted by nested VMCB/VMCS */
++#define X86EMUL_FILTERED        7
+
+ struct x86_emulate_ops {
+ 	void (*vm_bugged)(struct x86_emulate_ctxt *ctxt);
+@@ -493,6 +494,7 @@ enum x86_intercept {
+
+ int x86_decode_insn(struct x86_emulate_ctxt *ctxt, void *insn, int insn_len, int emulation_type);
+ bool x86_page_table_writing_insn(struct x86_emulate_ctxt *ctxt);
++#define EMULATION_REJECTED -2
+ #define EMULATION_FAILED -1
+ #define EMULATION_OK 0
+ #define EMULATION_RESTART 1
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index f7901cb4d..0f52f2b8b 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5716,8 +5716,10 @@ int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 err
+ 	r = RET_PF_INVALID;
+ 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
+ 		r = handle_mmio_page_fault(vcpu, cr2_or_gpa, direct);
+-		if (r == RET_PF_EMULATE)
++		if (r == RET_PF_EMULATE) {
++			emulation_type |= EMULTYPE_MMIO;
+ 			goto emulate;
++		}
+ 	}
+
+ 	if (r == RET_PF_INVALID) {
+@@ -5759,6 +5761,9 @@ int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 err
+ 	 */
+ 	if (!mmio_info_in_cache(vcpu, cr2_or_gpa, direct) && !is_guest_mode(vcpu))
+ 		emulation_type |= EMULTYPE_ALLOW_RETRY_PF;
++
++	if (mmio_info_in_cache(vcpu, cr2_or_gpa, direct))
++		emulation_type |= EMULTYPE_MMIO;
+ emulate:
+ 	return x86_emulate_instruction(vcpu, cr2_or_gpa, emulation_type, insn,
+ 				       insn_len);
+diff --git a/arch/x86/kvm/trace.h b/arch/x86/kvm/trace.h
+index 838433798..a5eea713a 100644
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@ -848,6 +848,39 @@ TRACE_EVENT(kvm_emulate_insn,
+ #define trace_kvm_emulate_insn_start(vcpu) trace_kvm_emulate_insn(vcpu, 0)
+ #define trace_kvm_emulate_insn_failed(vcpu) trace_kvm_emulate_insn(vcpu, 1)
+
++TRACE_EVENT(fwinst_reject_emulation,
++	TP_PROTO(struct kvm_vcpu *vcpu, int emulation_type),
++	TP_ARGS(vcpu, emulation_type),
++
++	TP_STRUCT__entry(
++		__field(__u64, rip)
++		__field(__u32, csbase)
++		__field(__u8,  len)
++		__array(__u8,  insn,    15)
++		__field(__u8,  flags)
++		__field(int,  emulation_type)
++		),
++
++	TP_fast_assign(
++		__entry->csbase = static_call(kvm_x86_get_segment_base)(vcpu, VCPU_SREG_CS);
++		__entry->len = vcpu->arch.emulate_ctxt->fetch.ptr
++			       - vcpu->arch.emulate_ctxt->fetch.data;
++		__entry->rip = vcpu->arch.emulate_ctxt->_eip - __entry->len;
++		memcpy(__entry->insn,
++		       vcpu->arch.emulate_ctxt->fetch.data,
++		       15);
++		__entry->flags = kei_decode_mode(vcpu->arch.emulate_ctxt->mode);
++		__entry->emulation_type = emulation_type;
++		),
++
++	TP_printk("%x:%llx:%s (%s), emulation type: %x",
++		  __entry->csbase, __entry->rip,
++		  __print_hex(__entry->insn, __entry->len),
++		  __print_symbolic(__entry->flags,
++				   kvm_trace_symbol_emul_flags),
++		  __entry->emulation_type)
++);
++
+ TRACE_EVENT(
+ 	vcpu_match_mmio,
+ 	TP_PROTO(gva_t gva, gpa_t gpa, bool write, bool gpa_match),
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 9bba53525..fe1413e9f 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5361,7 +5361,7 @@ static int handle_io(struct kvm_vcpu *vcpu)
+ 	++vcpu->stat.io_exits;
+
+ 	if (string)
+-		return kvm_emulate_instruction(vcpu, 0);
++		return kvm_emulate_instruction(vcpu, EMULTYPE_IO);
+
+ 	port = exit_qualification >> 16;
+ 	size = (exit_qualification & 7) + 1;
+@@ -5434,7 +5434,7 @@ static int handle_desc(struct kvm_vcpu *vcpu)
+ 	BUILD_BUG_ON(KVM_POSSIBLE_CR4_GUEST_BITS & X86_CR4_UMIP);
+
+ 	WARN_ON_ONCE(!kvm_is_cr4_bit_set(vcpu, X86_CR4_UMIP));
+-	return kvm_emulate_instruction(vcpu, 0);
++	return kvm_emulate_instruction(vcpu, EMULTYPE_UMIP);
+ }
+
+ static int handle_cr(struct kvm_vcpu *vcpu)
+@@ -5647,7 +5647,7 @@ static int handle_apic_access(struct kvm_vcpu *vcpu)
+ 			return kvm_skip_emulated_instruction(vcpu);
+ 		}
+ 	}
+-	return kvm_emulate_instruction(vcpu, 0);
++	return kvm_emulate_instruction(vcpu, EMULTYPE_APIC);
+ }
+
+ static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e179db7c1..a0be5ce17 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8902,6 +8902,13 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+
+ 		r = x86_decode_emulated_instruction(vcpu, emulation_type,
+ 						    insn, insn_len);
++
++		if (r == EMULATION_REJECTED) {
++			trace_fwinst_reject_emulation(vcpu, emulation_type & EMULTYPE_REASON_MASK);
++			kvm_queue_exception(vcpu, UD_VECTOR);
++			return 1;
++		}
++
+ 		if (r != EMULATION_OK)  {
+ 			if ((emulation_type & EMULTYPE_TRAP_UD) ||
+ 			    (emulation_type & EMULTYPE_TRAP_UD_FORCED)) {
